@@ -1,16 +1,42 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+МЕМОСТАТ v6.0 — RSS + Демо версия
+══════════════════════════════════════════════════════════════════════════════
+Система анализа жизненного цикла интернет-мемов
+
+ИСТОЧНИКИ ДАННЫХ:
+📡 RSS Google Trends — реальные тренды дня (бесплатно, без ключей)
+🧪 Демо-генератор — реалистичные временные ряды
+
+ОСОБЕННОСТИ:
+✅ Работает всегда — не требует API ключей
+✅ Реальные тренды через официальный RSS Google
+✅ Реалистичные демо-данные для анализа
+✅ Кэширование всех запросов
+✅ Под Windows + Яндекс.Браузер
+
+Автор: Проектная работа
+Дата: 2024
+"""
+
 import os
+import re
 import time
 import random
 import warnings
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
+from scipy.stats import kurtosis, skew
 import matplotlib
 
-matplotlib.use('TkAgg')
+matplotlib.use('TkAgg')  # для Windows
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import pickle
 import feedparser
 
@@ -81,7 +107,274 @@ Config.init_dirs()
 
 
 # ============================================================================
-# БЛОК 2: ПАРСЕР ЧЕРЕЗ RSS (РЕАЛЬНЫЕ ТРЕНДЫ + ДЕМО-ДАННЫЕ)
+# БЛОК 2: СЛОВАРИ ДЛЯ ФИЛЬТРАЦИИ МЕМОВ
+# ============================================================================
+
+# Сленговые слова (маркеры мемов)
+SLANG_WORDS = {
+    'кринж', 'хайп', 'рофл', 'краш', 'токс', 'сигма', 'скуф', 'альтушка',
+    'вайб', 'пруф', 'агриться', 'зашквар', 'душнила', 'чилл', 'ауф', 'ноу вэй',
+    'павлова', 'ждун', 'тролл', 'фейс', 'пепе', 'шрек', 'ленин гриб', 'превед медвед'
+}
+
+# Стоп-слова (что точно НЕ мемы)
+STOP_WORDS = {
+    'новости', 'погода', 'курс', 'доллар', 'евро', 'нефть', 'война', 'выборы',
+    'президент', 'путин', 'зеленский', 'байден', 'трамп', 'ковид', 'коронавирус',
+    'санкции', 'рубль', 'биткоин', 'крипта', 'футбол', 'хоккей', 'теннис',
+    'украина', 'россия', 'сша', 'китай', 'вчера', 'сегодня', 'завтра'
+}
+
+
+def is_meme_candidate(phrase: str) -> Tuple[bool, str]:
+    """
+    Проверяет, является ли фраза кандидатом в мемы.
+    Возвращает (True/False, причина)
+    """
+    phrase_lower = phrase.lower().strip()
+
+    # 1. Проверка длины (мемы обычно короткие)
+    if len(phrase_lower) < 3:
+        return False, "слишком короткое"
+    if len(phrase_lower) > 30:
+        return False, "слишком длинное"
+
+    # 2. Проверка на стоп-слова (новости, события)
+    for stop in STOP_WORDS:
+        if stop in phrase_lower:
+            return False, f"стоп-слово: {stop}"
+
+    # 3. Проверка на сленг
+    if phrase_lower in SLANG_WORDS:
+        return True, "сленговое слово"
+
+    # 4. Проверка на составные фразы (с пробелами)
+    if ' ' in phrase_lower:
+        words = phrase_lower.split()
+        # Фразы из 2-4 слов могут быть мемами
+        if 2 <= len(words) <= 4:
+            # Проверяем каждое слово
+            meme_words = 0
+            for w in words:
+                if w in SLANG_WORDS:
+                    meme_words += 1
+            if meme_words >= len(words) // 2:
+                return True, "составная фраза"
+
+    # 5. Наличие кавычек (часто указывает на цитату-мем)
+    if '"' in phrase or '«' in phrase or '»' in phrase:
+        return True, "в кавычках"
+
+    # 6. Наличие эмодзи (мемы часто с ними)
+    emoji_pattern = re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F700-\U0001F77F]')
+    if emoji_pattern.search(phrase):
+        return True, "содержит эмодзи"
+
+    return False, "не соответствует критериям"
+
+
+# ============================================================================
+# БЛОК 3: ПОВЕДЕНЧЕСКИЙ АНАЛИЗАТОР
+# ============================================================================
+
+class BehavioralAnalyzer:
+    """
+    Анализирует поведенческие паттерны запросов для отличия мемов от новостей
+    """
+
+    def analyze_behavior(self, query: str, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Анализирует поведенческие характеристики запроса
+        Возвращает словарь с метриками и вердикт (мем/не мем)
+        """
+        if df.empty or len(df) < 30:
+            return {'is_meme': False, 'reason': 'недостаточно данных', 'metrics': {}, 'score': 0}
+
+        values = df['value'].values
+
+        # ========= 1. СТАТИСТИЧЕСКИЕ МЕТРИКИ =========
+
+        # Коэффициент вариации (изменчивость)
+        cv = np.std(values) / (np.mean(values) + 0.01)
+
+        # Эксцесс (островершинность) — у мемов резкие пики
+        kurt = kurtosis(values)
+
+        # Асимметрия (скошенность) — у мемов быстрый рост и медленный спад
+        skewness = skew(values)
+
+        # Максимальное значение
+        max_val = np.max(values)
+
+        # Дней до пика (от начала)
+        peak_idx = np.argmax(values)
+        days_to_peak = peak_idx
+
+        # Дней после пика (до конца)
+        days_after_peak = len(values) - peak_idx - 1
+
+        # ========= 2. ВРЕМЕННЫЕ ХАРАКТЕРИСТИКИ =========
+
+        # Скорость роста до пика (ежедневный прирост в %)
+        if peak_idx > 0:
+            growth_rate = (max_val - values[0]) / (peak_idx + 1)
+            growth_rate_pct = (growth_rate / (max_val + 0.01)) * 100
+        else:
+            growth_rate_pct = 0
+
+        # Скорость спада после пика
+        if days_after_peak > 0:
+            decay_rate = (max_val - values[-1]) / (days_after_peak + 1)
+            decay_rate_pct = (decay_rate / (max_val + 0.01)) * 100
+        else:
+            decay_rate_pct = 0
+
+        # Время жизни (ширина на половине высоты)
+        half_max = max_val / 2
+        above_half = np.where(values >= half_max)[0]
+        if len(above_half) > 0:
+            fwhm = above_half[-1] - above_half[0]  # Full Width at Half Maximum
+        else:
+            fwhm = 0
+
+        # ========= 3. КОЛЕБАТЕЛЬНОСТЬ =========
+
+        # Количество локальных пиков (кроме главного)
+        peaks, _ = find_peaks(values, prominence=max_val * 0.1)
+        n_peaks = len(peaks) - 1 if len(peaks) > 0 else 0
+
+        # Средняя разница между соседними днями
+        daily_diff = np.abs(np.diff(values))
+        avg_volatility = np.mean(daily_diff)
+
+        # ========= 4. ОЦЕНКА ПОВЕДЕНЧЕСКИХ ПРИЗНАКОВ =========
+
+        score = 0
+        reasons = []
+
+        # Признак 1: Высокая изменчивость (мемы резко взлетают)
+        if cv > 1.5:
+            score += 2
+            reasons.append(f"высокая изменчивость (CV={cv:.2f})")
+        elif cv > 1.0:
+            score += 1
+            reasons.append(f"средняя изменчивость (CV={cv:.2f})")
+
+        # Признак 2: Островершинность (мемы имеют резкий пик)
+        if kurt > 3:
+            score += 2
+            reasons.append(f"острый пик (эксцесс={kurt:.2f})")
+        elif kurt > 1:
+            score += 1
+            reasons.append(f"умеренный пик (эксцесс={kurt:.2f})")
+
+        # Признак 3: Положительная асимметрия (быстрый рост, медленный спад)
+        if skewness > 0.5:
+            score += 2
+            reasons.append(f"положительная асимметрия (skew={skewness:.2f})")
+        elif skewness > 0:
+            score += 1
+            reasons.append(f"слабая асимметрия (skew={skewness:.2f})")
+
+        # Признак 4: Быстрый рост
+        if growth_rate_pct > 5:
+            score += 2
+            reasons.append(f"быстрый рост ({growth_rate_pct:.1f}%/день)")
+        elif growth_rate_pct > 2:
+            score += 1
+            reasons.append(f"умеренный рост ({growth_rate_pct:.1f}%/день)")
+
+        # Признак 5: Быстрый спад (мемы быстро забываются)
+        if decay_rate_pct > 3:
+            score += 2
+            reasons.append(f"быстрый спад ({decay_rate_pct:.1f}%/день)")
+        elif decay_rate_pct > 1:
+            score += 1
+            reasons.append(f"умеренный спад ({decay_rate_pct:.1f}%/день)")
+
+        # Признак 6: Короткая ширина пика (мемы не длятся долго)
+        if fwhm < 30:
+            score += 2
+            reasons.append(f"короткий пик ({fwhm} дней)")
+        elif fwhm < 60:
+            score += 1
+            reasons.append(f"средний пик ({fwhm} дней)")
+
+        # Признак 7: Количество дополнительных пиков (мемы иногда дают эхо)
+        if 1 <= n_peaks <= 3:
+            score += 1
+            reasons.append(f"есть вторичные пики ({n_peaks} шт.)")
+
+        # Признак 8: Дневная волатильность (мемы непредсказуемы)
+        if avg_volatility > 10:
+            score += 1
+            reasons.append(f"высокая волатильность ({avg_volatility:.1f})")
+
+        # ========= 5. ОТСЕИВАНИЕ НОВОСТЕЙ =========
+
+        # Новости имеют длинный плавный пик, часто симметричный
+        is_news = False
+        news_reason = None
+
+        # Признак новости: ширина пика > 60 дней и низкий эксцесс
+        if fwhm > 60 and kurt < 1:
+            is_news = True
+            news_reason = f"длинный плавный пик (ширина={fwhm}, эксцесс={kurt:.2f})"
+
+        # Признак новости: симметричный рост и спад
+        if abs(growth_rate_pct - decay_rate_pct) < 1 and growth_rate_pct < 2:
+            is_news = True
+            news_reason = f"симметричный рост/спад (разница={abs(growth_rate_pct - decay_rate_pct):.1f}%)"
+
+        # ========= 6. ИТОГОВЫЙ ВЕРДИКТ =========
+
+        # Порог для мема: нужно набрать минимум 4 балла
+        is_meme = (score >= 4) and not is_news and max_val > 15
+
+        metrics = {
+            'cv': round(cv, 2),
+            'kurtosis': round(kurt, 2),
+            'skewness': round(skewness, 2),
+            'growth_rate_pct': round(growth_rate_pct, 1),
+            'decay_rate_pct': round(decay_rate_pct, 1),
+            'fwhm': fwhm,
+            'n_peaks': n_peaks,
+            'volatility': round(avg_volatility, 1),
+            'score': score
+        }
+
+        reason = ' | '.join(reasons) if reasons else 'нет явных признаков'
+        if is_news:
+            reason = f"ОТСЕЯНО (новость): {news_reason} | {reason}"
+        elif is_meme:
+            reason = f"МЕМ (баллов: {score}): {reason}"
+        else:
+            reason = f"НЕ МЕМ (баллов: {score}): {reason}"
+
+        return {
+            'is_meme': is_meme,
+            'is_news': is_news,
+            'reason': reason,
+            'metrics': metrics,
+            'score': score
+        }
+
+    def print_behavior_report(self, query: str, analysis: Dict):
+        """Выводит отчет о поведенческом анализе"""
+        print(f"\n      📊 Поведенческий анализ для '{query}':")
+        print(f"         Статус: {analysis['reason']}")
+
+        if analysis['metrics']:
+            m = analysis['metrics']
+            print(f"         Метрики:")
+            print(f"            • Изменчивость: {m['cv']} | Острота пика: {m['kurtosis']}")
+            print(f"            • Асимметрия: {m['skewness']} | Балл: {m['score']}/10")
+            print(f"            • Рост: {m['growth_rate_pct']}%/день | Спад: {m['decay_rate_pct']}%/день")
+            print(f"            • Ширина пика: {m['fwhm']} дней | Вторичные пики: {m['n_peaks']}")
+
+
+# ============================================================================
+# БЛОК 4: ПАРСЕР ЧЕРЕЗ RSS (РЕАЛЬНЫЕ ТРЕНДЫ + ДЕМО-ДАННЫЕ)
 # ============================================================================
 
 class GoogleTrendsParser:
@@ -266,7 +559,7 @@ class GoogleTrendsParser:
 
 
 # ============================================================================
-# БЛОК 3: АНАЛИЗ ЖИЗНЕННОГО ЦИКЛА
+# БЛОК 5: АНАЛИЗ ЖИЗНЕННОГО ЦИКЛА
 # ============================================================================
 
 class MemeLifecycleAnalyzer:
@@ -438,7 +731,7 @@ class MemeLifecycleAnalyzer:
 
 
 # ============================================================================
-# БЛОК 4: ВИЗУАЛИЗАЦИЯ
+# БЛОК 6: ВИЗУАЛИЗАЦИЯ
 # ============================================================================
 
 class MemeViz:
@@ -516,7 +809,7 @@ class MemeViz:
 
 
 # ============================================================================
-# БЛОК 5: ГЕНЕРАТОР ОТЧЁТОВ
+# БЛОК 7: ГЕНЕРАТОР ОТЧЁТОВ
 # ============================================================================
 
 class ReportGenerator:
@@ -592,7 +885,7 @@ class ReportGenerator:
 
 
 # ============================================================================
-# БЛОК 6: ОСНОВНОЙ КЛАСС
+# БЛОК 8: ОСНОВНОЙ КЛАСС
 # ============================================================================
 
 class MemeStat:
@@ -608,6 +901,7 @@ class MemeStat:
         self.analyzer = MemeLifecycleAnalyzer()
         self.viz = MemeViz()
         self.reporter = ReportGenerator(self.analyzer)
+        self.behavioral = BehavioralAnalyzer()
 
         # Загружаем начальные данные, если база пуста
         if len(self.analyzer.memes_db) == 0:
@@ -624,7 +918,7 @@ class MemeStat:
             df = self.parser.get_interest_over_time(meme, 'today 12-m')
             if self.analyzer.add_meme_data(meme, df):
                 loaded += 1
-            time.sleep(1)  # небольшая задержка
+            time.sleep(1)
 
         print(f"\n✅ Загружено: {loaded} мемов")
 
@@ -643,14 +937,81 @@ class MemeStat:
         print("\n✅ Обновление завершено")
 
     def find_new(self):
-        """Ищет новые мемы в трендах"""
-        print("\n🔍 Поиск новых мемов...")
+        """Ищет новые мемы в трендах с фильтрацией (текстовой + поведенческой)"""
+        print("\n🔍 Поиск новых мемов в трендах...")
+        print("   (фильтруем по текстовым и поведенческим критериям)\n")
+
         trends = self.parser.get_daily_trends()
-        added = 0
+
+        if not trends:
+            print("   ⚠️ Не удалось получить тренды")
+            return
+
+        # Фильтруем мемы (сначала текстовая проверка)
+        memes_found = []
+        news_found = []
+        pending = []  # запросы, которые требуют поведенческого анализа
 
         for trend in trends:
+            # 1. Быстрая текстовая проверка
+            is_text_meme, text_reason = is_meme_candidate(trend)
+
+            if is_text_meme:
+                # Если текст похож на мем — добавляем сразу
+                memes_found.append((trend, f"текст: {text_reason}"))
+            else:
+                # Если не похож, но может быть мемом (короткое слово) — откладываем
+                if len(trend) < 15 and not any(stop in trend for stop in STOP_WORDS):
+                    pending.append((trend, text_reason))
+                else:
+                    news_found.append((trend, f"текст: {text_reason}"))
+
+        # 2. Поведенческий анализ для сомнительных запросов
+        print(f"\n   📊 ПЕРВИЧНАЯ ФИЛЬТРАЦИЯ:")
+        print(f"      ✅ Текстовые мемы: {len(memes_found)}")
+        print(f"      ⏳ Требуют анализа: {len(pending)}")
+        print(f"      ❌ Отсеяно текстом: {len(news_found)}")
+
+        if pending:
+            print(f"\n   🔬 ПРОВОДИМ ПОВЕДЕНЧЕСКИЙ АНАЛИЗ...")
+
+            for trend, text_reason in pending:
+                print(f"\n      Анализ: '{trend}'")
+
+                # Загружаем данные (короткий период для скорости)
+                df = self.parser.get_interest_over_time(trend, 'today 3-m')
+
+                if df.empty or len(df) < 30:
+                    news_found.append((trend, f"недостаточно данных: {text_reason}"))
+                    continue
+
+                # Поведенческий анализ
+                analysis = self.behavioral.analyze_behavior(trend, df)
+                self.behavioral.print_behavior_report(trend, analysis)
+
+                if analysis['is_meme']:
+                    memes_found.append((trend, analysis['reason']))
+                else:
+                    news_found.append((trend, analysis['reason']))
+
+                time.sleep(0.5)
+
+        # 3. Итоги фильтрации
+        print(f"\n   📊 ИТОГОВАЯ ФИЛЬТРАЦИЯ:")
+        print(f"   ✅ ОТОБРАНО МЕМОВ: {len(memes_found)}")
+        print(f"   ❌ ОТСЕЯНО: {len(news_found)}")
+
+        if memes_found:
+            print("\n   🎯 НАЙДЕННЫЕ МЕМЫ:")
+            for i, (meme, reason) in enumerate(memes_found[:15], 1):
+                short_reason = reason[:50] + "..." if len(reason) > 50 else reason
+                print(f"      {i}. {meme} — {short_reason}")
+
+        # 4. Добавляем только мемы
+        added = 0
+        for trend, reason in memes_found:
             if trend not in self.analyzer.memes_db:
-                print(f"\n   ➕ Потенциальный мем: {trend}")
+                print(f"\n   ➕ Добавление: {trend}")
                 df = self.parser.get_interest_over_time(trend, 'today 3-m')
                 if not df.empty and df['value'].max() > 20:
                     if self.analyzer.add_meme_data(trend, df):
@@ -658,6 +1019,15 @@ class MemeStat:
                 time.sleep(1)
 
         print(f"\n✅ Добавлено новых мемов: {added}")
+
+        # 5. Показываем примеры отсеянного
+        if news_found:
+            print(f"\n   📰 ПРИМЕРЫ ОТСЕЯННЫХ ЗАПРОСОВ:")
+            for i, (item, reason) in enumerate(news_found[:5], 1):
+                short_reason = reason[:50] + "..." if len(reason) > 50 else reason
+                print(f"      {i}. {item} — {short_reason}")
+            if len(news_found) > 5:
+                print(f"      ... и ещё {len(news_found) - 5} запросов")
 
     def show(self, query: str):
         """Показывает информацию о меме"""
@@ -682,7 +1052,6 @@ class MemeStat:
             print("\n📭 База мемов пуста")
             return
 
-        # Группировка по стадиям
         stages = {}
         for m in memes:
             stages.setdefault(m['stage'], []).append(m)
@@ -694,7 +1063,6 @@ class MemeStat:
             if stage_name in stages:
                 items = stages[stage_name]
                 print(f"\n{stage_display} ({len(items)}):")
-                # for m in sorted(items, key=lambda x: x['stage_info']['rel_value'], reverse=True)[:5]:
                 for m in sorted(items, key=lambda x: x['stage_info']['rel_value'], reverse=True):
                     rel = m['stage_info']['rel_value']
                     growth = m['stage_info']['growth_rate']
@@ -708,7 +1076,6 @@ class MemeStat:
         """
         print(f"\n🔍 Поиск мема: '{query}'")
 
-        # Проверяем, есть ли уже в базе
         meme = self.analyzer.get_meme(query)
         if meme:
             print(f"   ✅ Мем найден в базе!")
@@ -719,15 +1086,12 @@ class MemeStat:
                 self.viz.plot_lifecycle(meme, plot_path)
             return
 
-        # Если нет в базе, пробуем добавить
         print(f"   🔎 Мема '{query}' нет в базе. Пытаюсь добавить...")
 
-        # Проверяем, есть ли в трендах
         trends = self.parser.get_daily_trends()
         if query.lower() in [t.lower() for t in trends]:
             print(f"   ✅ Мем '{query}' найден в текущих трендах!")
 
-        # Загружаем данные
         print(f"   📥 Загрузка данных для '{query}'...")
         df = self.parser.get_interest_over_time(query, 'today 12-m')
 
@@ -736,11 +1100,8 @@ class MemeStat:
             print(f"   💡 Попробуйте другое написание или поищите через 'найти'")
             return
 
-        # Добавляем в базу
         if self.analyzer.add_meme_data(query, df):
             print(f"   ✅ Мем '{query}' успешно добавлен!")
-
-            # Показываем информацию
             meme = self.analyzer.get_meme(query)
             if meme:
                 self.viz.print_meme_info(meme)
@@ -751,26 +1112,62 @@ class MemeStat:
         else:
             print(f"   ❌ Не удалось добавить мем '{query}'")
 
+    def delete_all_memes(self):
+        """Удаляет все мемы из базы данных"""
+        print("\n⚠️ ВНИМАНИЕ! Вы собираетесь удалить ВСЕ мемы из базы.")
+        print(f"   В базе сейчас {len(self.analyzer.memes_db)} мемов.")
+
+        confirmation = input("\n   Подтвердите удаление (y/n): ").lower()
+
+        if confirmation == 'y':
+            self.analyzer.memes_db.clear()
+            self.analyzer.save_data()
+
+            data_file = os.path.join(Config.DATA_DIR, 'memes_db.pkl')
+            if os.path.exists(data_file):
+                os.remove(data_file)
+
+            if os.path.exists(Config.PLOTS_DIR):
+                for file in os.listdir(Config.PLOTS_DIR):
+                    file_path = os.path.join(Config.PLOTS_DIR, file)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                    except:
+                        pass
+
+            print("\n✅ ВСЕ мемы успешно удалены из базы!")
+            print("   База теперь пуста. Используйте 'найти' или 'найти_мем', чтобы добавить новые мемы.")
+        else:
+            print("\n❌ Удаление отменено.")
+
 
 # ============================================================================
-# БЛОК 7: ИНТЕРАКТИВНЫЙ РЕЖИМ
+# БЛОК 9: ИНТЕРАКТИВНЫЙ РЕЖИМ
 # ============================================================================
+
+def show_commands():
+    """Показывает список доступных команд"""
+    print("\n" + "📋" * 30)
+    print("   ДОСТУПНЫЕ КОМАНДЫ:")
+    print("   • список          — показать все мемы")
+    print("   • инфо НАЗВАНИЕ    — информация о меме")
+    print("   • найти мем НАЗВАНИЕ — поиск и добавление мема")
+    print("   • обновить        — обновить все данные")
+    print("   • найти           — поиск новых мемов в трендах")
+    print("   • отчёт           — сгенерировать отчёт")
+    print("   • удалить все     — УДАЛИТЬ ВСЕ МЕМЫ из базы")
+    print("   • команды         — показать этот список")
+    print("   • выход           — завершить")
+    print("📋" * 30 + "\n")
+
 
 def main():
     """Главная функция"""
 
     memestat = MemeStat()
 
-    print("\n" + "📋" * 30)
-    print("   КОМАНДЫ:")
-    print("   • список       — показать все мемы")
-    print("   • инфо НАЗВАНИЕ — информация о меме")
-    print("   • найти мем НАЗВАНИЕ — поиск информации о конкретном меме")
-    print("   • обновить     — обновить все данные")
-    print("   • найти        — поиск новых мемов в трендах")
-    print("   • отчёт        — сгенерировать отчёт")
-    print("   • выход        — завершить")
-    print("📋" * 30 + "\n")
+    show_commands()
 
     while True:
         try:
@@ -779,6 +1176,10 @@ def main():
             if cmd == 'выход':
                 print("\n👋 До свидания!")
                 break
+
+            elif cmd == 'команды':
+                show_commands()
+                continue
 
             elif cmd == 'список':
                 memestat.list_all()
@@ -792,16 +1193,26 @@ def main():
             elif cmd == 'отчёт':
                 memestat.reporter.save_report()
 
+            elif cmd == 'удалить все':
+                memestat.delete_all_memes()
+
             elif cmd.startswith('инфо '):
                 query = cmd[5:].strip()
                 memestat.show(query)
 
             elif cmd.startswith('найти мем '):
                 query = cmd[9:].strip()
-                memestat.find_meme(query)  # новая команда с поиском
+                memestat.find_meme(query)
 
             elif cmd:
                 print(f"❌ Неизвестная команда: {cmd}")
+                show_commands()
+                continue
+
+            print("\n" + "─" * 50)
+            print("   Введите 'команды' для просмотра доступных команд")
+            print("   Введите 'выход' для завершения")
+            print("─" * 50)
 
         except KeyboardInterrupt:
             print("\n\n👋 Прервано пользователем")
@@ -810,6 +1221,7 @@ def main():
             print(f"\n❌ Ошибка: {e}")
             import traceback
             traceback.print_exc()
+            print("\n   Введите 'команды' для просмотра доступных команд")
 
 
 if __name__ == "__main__":
